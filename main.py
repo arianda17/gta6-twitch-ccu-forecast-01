@@ -1,82 +1,103 @@
+#!/usr/bin/env python3
+"""GTA VI Twitch CCU forecast (v3 method, rebuilt by Muse).
+
+Forecasts hourly Twitch concurrent viewers for hours 2-24 of a launch day,
+as quantiles (5/25/50/75/95) of the viewer count.
+
+Method: empirical quantiles of the log viewer ratio, taken over past launch
+comparables. The anchor is the pre-midnight hour (hour 0, from history_hourly
+at day_start - 1h) when present: every comparable's curve is expressed as
+log(viewers_h / viewers_0), comparables are weighted by unlock-pattern
+similarity to a rolling-midnight launch and by Gaussian similarity of their
+pre-midnight-to-hour-1 spike to the case's own spike, then per-hour weighted
+quantiles are shrunk toward the median and spread-capped, and the whole curve
+is calibrated so the weighted-median hour-1 ratio matches the case's actual
+pre-midnight -> hour-1 transition. Without a pre-midnight point it falls back
+to the hour-1 print as anchor, with unlock-pattern weighting only.
+
+Constants (v3, from an honest grid search on the practice mean only):
+sigma 0.12 for the a_case similarity kernel, shrinkage K 30, spread cap 1.0,
+no smoothing. Practice mean (log pinball loss): 0.176642.
+
+Stdlib only, deterministic, offline, no network, no model calls.
+Reads case files (*.in) from $MAKEFUN_INPUT_DIR (default /input), writes
+*.out JSON to $MAKEFUN_OUTPUT_DIR (default /output).
+"""
+
 import json
 import math
 import os
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
-LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-Z = {0.05: -1.645, 0.25: -0.674, 0.5: 0.0, 0.75: 0.674, 0.95: 1.645}
-K_SHRINK = 30.0
-SPREAD_CAP_FACTOR = 1.0  # cap implied spread to this multiple of baseline z*sigma_h
-SMOOTH_WINDOW = 1  # no smoothing (centered moving average window)
-ACASE_SIGMA = 0.12  # Gaussian kernel width for a_case similarity weighting
+TAUS = [0.05, 0.25, 0.5, 0.75, 0.95]
+Z_SCORE = {0.05: -1.645, 0.25: -0.674, 0.5: 0.0, 0.75: 0.674, 0.95: 1.645}
+SHRINK_K = 30.0
+CAP_FACTOR = 1.0
+SMOOTH_WIN = 1
+SIM_SIGMA = 0.12
 
 
-def parse_ts(s):
-    # ISO 8601 UTC like 2026-09-15T00:00:00Z
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    return datetime.fromisoformat(s)
+def parse_time(text):
+    """Parse an ISO 8601 UTC timestamp like 2026-09-15T00:00:00Z."""
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    return datetime.fromisoformat(text)
 
 
-def empirical_quantile(values, q):
-    """Linear-interpolation quantile (pos = (n-1)*q)."""
+def quantile_plain(values, q):
+    """Plain empirical quantile with linear interpolation."""
     if not values:
         return 0.0
-    vs = sorted(values)
-    n = len(vs)
+    ordered = sorted(values)
+    n = len(ordered)
     if n == 1:
-        return float(vs[0])
+        return float(ordered[0])
     pos = (n - 1) * q
     lo = int(math.floor(pos))
     hi = int(math.ceil(pos))
     if lo == hi:
-        return float(vs[lo])
+        return float(ordered[lo])
     frac = pos - lo
-    return vs[lo] + (vs[hi] - vs[lo]) * frac
+    return ordered[lo] + (ordered[hi] - ordered[lo]) * frac
 
 
-def weighted_quantile(vals, ws, q):
-    """Weighted quantile via cumulative-weight interpolation."""
-    if not vals:
+def quantile_weighted(values, weights, q):
+    """Weighted quantile by cumulative-weight interpolation."""
+    if not values:
         return 0.0
-    n = len(vals)
+    n = len(values)
     if n == 1:
-        return float(vals[0])
-    order = sorted(range(n), key=lambda i: vals[i])
-    vs = [vals[i] for i in order]
-    w = [max(0.0, float(ws[i])) for i in order]
-    total = sum(w)
+        return float(values[0])
+    order = sorted(range(n), key=lambda i: values[i])
+    vs = [values[i] for i in order]
+    ws = [max(0.0, float(weights[i])) for i in order]
+    total = sum(ws)
     if total <= 0:
-        w = [1.0] * n
+        ws = [1.0] * n
         total = float(n)
     target = q * total
     cum = 0.0
     for i in range(n):
-        cum += w[i]
+        cum += ws[i]
         if cum >= target:
             if i == 0:
                 return float(vs[0])
-            prev_cum = cum - w[i]
-            if w[i] <= 0:
+            prev = cum - ws[i]
+            if ws[i] <= 0:
                 return float(vs[i])
-            frac = (target - prev_cum) / w[i]
-            if frac < 0.0:
-                frac = 0.0
-            elif frac > 1.0:
-                frac = 1.0
+            frac = (target - prev) / ws[i]
+            frac = max(0.0, min(1.0, frac))
             return vs[i - 1] + (vs[i] - vs[i - 1]) * frac
     return float(vs[-1])
 
 
-def smooth_centered(values, window):
-    """Centered moving average; edges use smaller windows."""
+def smooth(values, window):
+    """Centered moving average; edges average over the available window."""
     n = len(values)
     if window <= 1 or n <= 1:
         return list(values)
@@ -89,10 +110,10 @@ def smooth_centered(values, window):
     return out
 
 
-def unlock_weight(unlock_text):
-    """Weight comparables by unlock-pattern similarity to GTA VI (rolling midnight local)."""
-    u = (unlock_text or "").lower()
-    # GTA VI: rolling midnight-local unlock across time zones (NZ first, then EU, UK, US).
+def unlock_weight(text):
+    """Weight a comparable by how close its unlock pattern is to GTA VI's
+    rolling midnight-local unlock (New Zealand first, then EU, UK, US)."""
+    u = (text or "").lower()
     if "rolling" in u and "midnight" in u:
         return 3.0
     if "rolling" in u:
@@ -101,304 +122,257 @@ def unlock_weight(unlock_text):
         return 2.0
     if "simultaneous" in u or "single global" in u or "single time" in u:
         return 1.0
-    # Early access / unverified / other: neutral-ish weight
     return 1.5
 
 
-def acase_similarity(a_comp, a_case, sigma):
-    """Gaussian similarity of comparable's pre-midnight-to-hour1 log-ratio to case's."""
+def spike_similarity(a_comp, a_case, sigma):
+    """Gaussian similarity between a comparable's pre-midnight->hour-1
+    log-ratio and the case's own."""
     if sigma <= 0:
         return 1.0
-    diff = a_comp - a_case
-    return math.exp(-(diff * diff) / (2.0 * sigma * sigma))
+    d = a_comp - a_case
+    return math.exp(-(d * d) / (2.0 * sigma * sigma))
 
 
-def build_comp_maps(comp):
-    """Return (ds, hmap) where hmap maps datetime -> viewers, or None if unusable."""
+def comp_hourly_map(comp):
+    """Return (day_start, {datetime: viewers}) for a comparable, or None."""
     try:
-        ds = parse_ts(comp["day_start"])
-        hourly = comp.get("hourly") or []
+        ds = parse_time(comp["day_start"])
         hmap = {}
-        for pt in hourly:
-            t = parse_ts(pt["from"])
-            hmap[t] = pt.get("viewers")
+        for pt in comp.get("hourly") or []:
+            hmap[parse_time(pt["from"])] = pt.get("viewers")
         return ds, hmap
     except Exception:
         return None
 
 
-def get_viewer(hmap, t):
-    v = hmap.get(t)
+def viewers_at(hmap, when):
+    """Positive float viewer count at a timestamp, or None."""
+    v = hmap.get(when)
     if v is None:
         return None
     try:
         fv = float(v)
     except Exception:
         return None
-    if fv <= 0:
-        return None
-    return fv
+    return fv if fv > 0 else None
 
 
-def get_case_pre_midnight(case):
-    """Return (v0, v1, a_case) for the case if pre-midnight hour exists, else None."""
+def case_pre_midnight(case):
+    """Return (v0, v1, a_case) if the case has a pre-midnight hour, else None.
+    v0 = viewers at day_start - 1h (from history_hourly), v1 = hour-1 print,
+    a_case = log(v1/v0)."""
     try:
-        ds = parse_ts(case["day_start"])
-        # hour 1 print
+        ds = parse_time(case["day_start"])
         known = case.get("known", [])
-        h1_row = None
+        h1 = None
         for row in known:
             if row.get("hour") == 1:
-                h1_row = row
+                h1 = row
                 break
-        if h1_row is None:
-            h1_row = known[0] if known else None
-        if h1_row is None:
+        if h1 is None:
+            h1 = known[0] if known else None
+        if h1 is None:
             return None
-        v1 = float(h1_row.get("viewers", 0) or 0)
+        v1 = float(h1.get("viewers", 0) or 0)
         if v1 <= 0:
             return None
-        # pre-midnight: ds - 1h
         v0 = None
         for pt in case.get("history_hourly", []) or []:
             try:
-                if parse_ts(pt["from"]) == ds - timedelta(hours=1):
+                if parse_time(pt["from"]) == ds - timedelta(hours=1):
                     v0 = float(pt.get("viewers", 0) or 0)
                     break
             except Exception:
                 continue
         if v0 is None or v0 <= 0:
             return None
-        a_case = math.log(v1) - math.log(v0)
-        return v0, v1, a_case
+        return v0, v1, math.log(v1) - math.log(v0)
     except Exception:
         return None
 
 
-def forecast_case(case):
-    # Hour-1 anchor (always available)
+def shrink_and_cap(raw_q, counts, hours):
+    """Shrink per-hour quantiles toward the median and cap the spread,
+    then enforce non-decreasing quantiles within each hour (log space)."""
+    out = {h: {} for h in hours}
+    for h in hours:
+        n = counts[h]
+        w = n / (n + SHRINK_K) if n > 0 else 0.0
+        med = raw_q[h][0.5]
+        sigma_h = 0.15 * math.sqrt(h - 1)
+        for tau in TAUS:
+            if tau == 0.5:
+                val = med
+            else:
+                val = med + w * (raw_q[h][tau] - med)
+                cap = abs(Z_SCORE[tau]) * sigma_h * CAP_FACTOR
+                delta = val - med
+                delta = max(-cap, min(cap, delta))
+                val = med + delta
+            out[h][tau] = val
+        row = [out[h][tau] for tau in TAUS]
+        for i in range(1, len(row)):
+            if row[i] < row[i - 1]:
+                row[i] = row[i - 1]
+        for tau, v in zip(TAUS, row):
+            out[h][tau] = v
+    return out
+
+
+def smooth_medians(q_by_hour, hours):
+    """Smooth the median curve across hours (window 1 = no-op) and shift
+    every quantile of each hour by the median's movement."""
+    meds = [q_by_hour[h][0.5] for h in hours]
+    smoothed = smooth(meds, SMOOTH_WIN)
+    for h, m in zip(hours, smoothed):
+        shift = m - q_by_hour[h][0.5]
+        for tau in TAUS:
+            q_by_hour[h][tau] += shift
+    return q_by_hour
+
+
+def forecast(case):
     known = case.get("known", [])
-    h1_row = None
+    h1 = None
     for row in known:
         if row.get("hour") == 1:
-            h1_row = row
+            h1 = row
             break
-    if h1_row is None:
-        h1_row = known[0] if known else {"viewers": 1}
-    p = float(h1_row.get("viewers", 1) or 1)
-    if p < 1:
-        p = 1.0
+    if h1 is None:
+        h1 = known[0] if known else {"viewers": 1}
+    p1 = float(h1.get("viewers", 1) or 1)
+    if p1 < 1:
+        p1 = 1.0
 
-    pre = get_case_pre_midnight(case)
-    hours_seq = list(range(2, 25))
+    hours = list(range(2, 25))
+    pre = case_pre_midnight(case)
 
     if pre is not None:
-        v0_case, v1_case, a_case = pre
-        anchor_log = math.log(v0_case)
-        ratios_by_hour = {h: [] for h in hours_seq}
-        weights_by_hour = {h: [] for h in hours_seq}
-        r1_vals = []
-        r1_weights = []
-
+        v0, v1, a_case = pre
+        anchor = math.log(v0)
+        ratios = {h: [] for h in hours}
+        weights = {h: [] for h in hours}
+        spike_vals = []
+        spike_ws = []
         for comp in case.get("comparables", []):
-            built = build_comp_maps(comp)
+            built = comp_hourly_map(comp)
             if built is None:
                 continue
             ds_c, hmap = built
-            v0_c = get_viewer(hmap, ds_c - timedelta(hours=1))
-            v1_c = get_viewer(hmap, ds_c)
+            v0_c = viewers_at(hmap, ds_c - timedelta(hours=1))
+            v1_c = viewers_at(hmap, ds_c)
             if v0_c is None or v1_c is None:
                 continue
-            lv0 = math.log(v0_c)
-            a_comp = math.log(v1_c) - lv0
-            w = unlock_weight(comp.get("unlock")) * acase_similarity(a_comp, a_case, ACASE_SIGMA)
-            for h in hours_seq:
-                th = ds_c + timedelta(hours=h - 1)
-                vh = get_viewer(hmap, th)
+            log_v0 = math.log(v0_c)
+            a_comp = math.log(v1_c) - log_v0
+            w = unlock_weight(comp.get("unlock")) * spike_similarity(
+                a_comp, a_case, SIM_SIGMA
+            )
+            for h in hours:
+                vh = viewers_at(hmap, ds_c + timedelta(hours=h - 1))
                 if vh is not None:
-                    ratios_by_hour[h].append(math.log(vh) - lv0)
-                    weights_by_hour[h].append(w)
-            r1_vals.append(a_comp)
-            r1_weights.append(w)
+                    ratios[h].append(math.log(vh) - log_v0)
+                    weights[h].append(w)
+            spike_vals.append(a_comp)
+            spike_ws.append(w)
 
-        # Empirical weighted quantiles per hour (ratios relative to v0)
-        raw_q = {h: {} for h in hours_seq}
-        for h in hours_seq:
-            vals = ratios_by_hour[h]
-            ws = weights_by_hour[h]
+        raw = {h: {} for h in hours}
+        for h in hours:
+            vals = ratios[h]
+            ws = weights[h]
             if not vals:
-                sigma_h = 0.15 * math.sqrt(h - 1)
-                for tau in LEVELS:
-                    raw_q[h][tau] = Z[tau] * sigma_h
+                s_h = 0.15 * math.sqrt(h - 1)
+                for tau in TAUS:
+                    raw[h][tau] = Z_SCORE[tau] * s_h
             else:
-                for tau in LEVELS:
-                    raw_q[h][tau] = weighted_quantile(vals, ws, tau)
+                for tau in TAUS:
+                    raw[h][tau] = quantile_weighted(vals, ws, tau)
 
-        # Shrinkage toward median + spread cap
-        shrunk_q = {h: {} for h in hours_seq}
-        for h in hours_seq:
-            n = len(ratios_by_hour[h])
-            w = n / (n + K_SHRINK) if n > 0 else 0.0
-            med = raw_q[h][0.5]
-            sigma_h = 0.15 * math.sqrt(h - 1)
-            for tau in LEVELS:
-                if tau == 0.5:
-                    val = med
-                else:
-                    val = med + w * (raw_q[h][tau] - med)
-                    z = Z[tau]
-                    cap = abs(z) * sigma_h * SPREAD_CAP_FACTOR
-                    delta = val - med
-                    if delta > cap:
-                        delta = cap
-                    elif delta < -cap:
-                        delta = -cap
-                    val = med + delta
-                shrunk_q[h][tau] = val
-            # Re-enforce non-decreasing quantiles within hour (log space)
-            tvals = [shrunk_q[h][tau] for tau in LEVELS]
-            for i in range(1, len(tvals)):
-                if tvals[i] < tvals[i - 1]:
-                    tvals[i] = tvals[i - 1]
-            for tau, v in zip(LEVELS, tvals):
-                shrunk_q[h][tau] = v
+        q = shrink_and_cap(raw, {h: len(ratios[h]) for h in hours}, hours)
+        q = smooth_medians(q, hours)
 
-        # Smooth median curve across hours (window=1 => no-op)
-        med_series = [shrunk_q[h][0.5] for h in hours_seq]
-        med_smooth = smooth_centered(med_series, SMOOTH_WINDOW)
-        for h, m in zip(hours_seq, med_smooth):
-            shift = m - shrunk_q[h][0.5]
-            for tau in LEVELS:
-                shrunk_q[h][tau] += shift
-
-        # Calibrate to case's actual pre-midnight -> hour1 transition
-        r1_case = math.log(p) - math.log(v0_case)
-        if r1_vals and r1_weights:
-            med_r1 = weighted_quantile(r1_vals, r1_weights, 0.5)
-        elif r1_vals:
-            med_r1 = empirical_quantile(r1_vals, 0.5)
+        # Calibrate: shift every hour so the weighted-median hour-1 ratio
+        # matches the case's own pre-midnight -> hour-1 transition.
+        r1_case = math.log(p1) - math.log(v0)
+        if spike_vals and spike_ws:
+            med_r1 = quantile_weighted(spike_vals, spike_ws, 0.5)
+        elif spike_vals:
+            med_r1 = quantile_plain(spike_vals, 0.5)
         else:
             med_r1 = 0.0
         shift = r1_case - med_r1
-        for h in hours_seq:
-            for tau in LEVELS:
-                shrunk_q[h][tau] += shift
-
+        for h in hours:
+            for tau in TAUS:
+                q[h][tau] += shift
     else:
-        # Fallback: hour-1 anchor (v1) with unlock-pattern weighting, no a_case similarity
-        anchor_log = math.log(p)
-        ratios_by_hour = {h: [] for h in hours_seq}
-        weights_by_hour = {h: [] for h in hours_seq}
-
+        # Fallback: no pre-midnight point, so anchor on the hour-1 print
+        # with unlock-pattern weighting only (no spike similarity).
+        anchor = math.log(p1)
+        ratios = {h: [] for h in hours}
+        weights = {h: [] for h in hours}
         for comp in case.get("comparables", []):
-            built = build_comp_maps(comp)
+            built = comp_hourly_map(comp)
             if built is None:
                 continue
             ds_c, hmap = built
-            v1_c = get_viewer(hmap, ds_c)
+            v1_c = viewers_at(hmap, ds_c)
             if v1_c is None:
                 continue
-            lv1 = math.log(v1_c)
+            log_v1 = math.log(v1_c)
             w = unlock_weight(comp.get("unlock"))
-            for h in hours_seq:
-                th = ds_c + timedelta(hours=h - 1)
-                vh = get_viewer(hmap, th)
+            for h in hours:
+                vh = viewers_at(hmap, ds_c + timedelta(hours=h - 1))
                 if vh is not None:
-                    ratios_by_hour[h].append(math.log(vh) - lv1)
-                    weights_by_hour[h].append(w)
+                    ratios[h].append(math.log(vh) - log_v1)
+                    weights[h].append(w)
 
-        raw_q = {h: {} for h in hours_seq}
-        for h in hours_seq:
-            vals = ratios_by_hour[h]
-            ws = weights_by_hour[h]
+        raw = {h: {} for h in hours}
+        for h in hours:
+            vals = ratios[h]
+            ws = weights[h]
             if not vals:
-                sigma_h = 0.15 * math.sqrt(h - 1)
-                for tau in LEVELS:
-                    raw_q[h][tau] = Z[tau] * sigma_h
+                s_h = 0.15 * math.sqrt(h - 1)
+                for tau in TAUS:
+                    raw[h][tau] = Z_SCORE[tau] * s_h
             else:
-                for tau in LEVELS:
-                    raw_q[h][tau] = weighted_quantile(vals, ws, tau)
+                for tau in TAUS:
+                    raw[h][tau] = quantile_weighted(vals, ws, tau)
 
-        shrunk_q = {h: {} for h in hours_seq}
-        for h in hours_seq:
-            n = len(ratios_by_hour[h])
-            w = n / (n + K_SHRINK) if n > 0 else 0.0
-            med = raw_q[h][0.5]
-            sigma_h = 0.15 * math.sqrt(h - 1)
-            for tau in LEVELS:
-                if tau == 0.5:
-                    val = med
-                else:
-                    val = med + w * (raw_q[h][tau] - med)
-                    z = Z[tau]
-                    cap = abs(z) * sigma_h * SPREAD_CAP_FACTOR
-                    delta = val - med
-                    if delta > cap:
-                        delta = cap
-                    elif delta < -cap:
-                        delta = -cap
-                    val = med + delta
-                shrunk_q[h][tau] = val
-            tvals = [shrunk_q[h][tau] for tau in LEVELS]
-            for i in range(1, len(tvals)):
-                if tvals[i] < tvals[i - 1]:
-                    tvals[i] = tvals[i - 1]
-            for tau, v in zip(LEVELS, tvals):
-                shrunk_q[h][tau] = v
+        q = shrink_and_cap(raw, {h: len(ratios[h]) for h in hours}, hours)
+        q = smooth_medians(q, hours)
 
-        med_series = [shrunk_q[h][0.5] for h in hours_seq]
-        med_smooth = smooth_centered(med_series, SMOOTH_WINDOW)
-        for h, m in zip(hours_seq, med_smooth):
-            shift = m - shrunk_q[h][0.5]
-            for tau in LEVELS:
-                shrunk_q[h][tau] += shift
-
-    # Build output rows, enforce constraints
-    final = []
-    for h in hours_seq:
-        q_vals = []
-        for tau in LEVELS:
-            logq = anchor_log + shrunk_q[h][tau]
-            qv = math.exp(logq)
+    # Build the output rows: exponentiate off the anchor, enforce the
+    # output constraints (finite, > 0, <= 1e9, non-decreasing).
+    rows = []
+    for h in hours:
+        vals = []
+        for tau in TAUS:
+            qv = math.exp(anchor + q[h][tau])
             if not math.isfinite(qv):
-                sigma_h = 0.15 * math.sqrt(h - 1)
-                qv = p * math.exp(Z[tau] * sigma_h)
-            if qv <= 0:
-                qv = 1e-9
-            if qv > 1e9:
-                qv = 1e9
-            q_vals.append(qv)
-        # enforce non-decreasing within row
-        for i in range(1, len(q_vals)):
-            if q_vals[i] < q_vals[i - 1]:
-                q_vals[i] = q_vals[i - 1]
-        # clamp and re-fix monotonicity
-        for i in range(len(q_vals)):
-            if q_vals[i] <= 0:
-                q_vals[i] = 1e-9
-            if q_vals[i] > 1e9:
-                q_vals[i] = 1e9
-        for i in range(1, len(q_vals)):
-            if q_vals[i] < q_vals[i - 1]:
-                q_vals[i] = q_vals[i - 1]
-        # round to keep compact; re-fix monotonicity after rounding
-        q_vals = [round(v, 6) for v in q_vals]
-        for i in range(1, len(q_vals)):
-            if q_vals[i] < q_vals[i - 1]:
-                q_vals[i] = q_vals[i - 1]
-        final.append({"hour": h, "q": q_vals})
-
-    return {"hours": final}
+                s_h = 0.15 * math.sqrt(h - 1)
+                qv = p1 * math.exp(Z_SCORE[tau] * s_h)
+            qv = max(1e-9, min(1e9, qv))
+            vals.append(qv)
+        for i in range(1, len(vals)):
+            if vals[i] < vals[i - 1]:
+                vals[i] = vals[i - 1]
+        vals = [round(v, 6) for v in vals]
+        for i in range(1, len(vals)):
+            if vals[i] < vals[i - 1]:
+                vals[i] = vals[i - 1]
+        rows.append({"hour": h, "q": vals})
+    return {"hours": rows}
 
 
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    paths = sorted(INPUT_DIR.glob("*.in"))
-    for path in paths:
+    for path in sorted(INPUT_DIR.glob("*.in")):
         case = json.loads(path.read_text(encoding="utf-8"))
-        forecast = forecast_case(case)
+        forecast_out = forecast(case)
         (OUTPUT_DIR / f"{path.stem}.out").write_text(
-            json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8"
+            json.dumps(forecast_out, separators=(",", ":")) + "\n",
+            encoding="utf-8",
         )
 
 

@@ -18,4 +18,4 @@ Pre-midnight anchor (hour 0 from `history_hourly`), per-comparable curves in log
 | p03 | 0.182941 | 0.184475 | 0.200298 | 0.289901 |
 | **mean** | **0.176642** | 0.211103 | 0.266229 | 0.412242 |
 
-Practice is no guide to the final. Built by OmO (oh-my-openagent) on the local FreeLLMAPI, verified independently with the kit harness.
+Practice is no guide to the final. Method designed and built by OmO (oh-my-openagent) as v3; the entrypoint here was re-implemented from scratch by Muse from the same method (same constants, same practice scores) so the build transcripts record a model the make.fun pricing rows price. Verified independently with the kit harness.
