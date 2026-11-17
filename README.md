@@ -1,8 +1,22 @@
-# GTA VI Twitch CCU Forecast — Muse variant v3
+# gta6-twitch-ccu-forecast-01
 
-Entry for [Forecast GTA VI's launch-day Twitch viewers hour by hour](https://make.fun/bounty/gta6-twitch-ccu-forecast-01) (make.fun, $250).
+[![make.fun · gta6-twitch-ccu-forecast-01](https://make.fun/badge/gta6-twitch-ccu-forecast-01.svg)](https://make.fun/bounty/gta6-twitch-ccu-forecast-01?utm_source=github&utm_medium=readme&utm_campaign=gta6-twitch-ccu-forecast-01)
+[![rank](https://make.fun/badge/gta6-twitch-ccu-forecast-01/arianda17/gta6-twitch-ccu-forecast-01/rank.svg)](https://make.fun/bounty/gta6-twitch-ccu-forecast-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=gta6-twitch-ccu-forecast-01)
+[![reward](https://make.fun/badge/gta6-twitch-ccu-forecast-01/arianda17/gta6-twitch-ccu-forecast-01/reward.svg)](https://make.fun/bounty/gta6-twitch-ccu-forecast-01?utm_source=github&utm_medium=readme&utm_campaign=gta6-twitch-ccu-forecast-01)
 
-Python 3.13, standard library only. `main.py` reads a case at `$MAKEFUN_INPUT_DIR` (or `/input`) and writes one forecast per case to `$MAKEFUN_OUTPUT_DIR` (or `/output`): 23 rows, hours 2–24, five quantiles each.
+Forecasts GTA VI's launch-day Twitch concurrent viewers hour by hour (hours 2-24, five quantiles each) from past launch comparables, using a pre-midnight anchor and similarity-weighted log-ratio quantiles. Practice mean pinball loss 0.176642.
+
+## Run it
+
+```sh
+python3 main.py
+```
+
+Reads a case at `$MAKEFUN_INPUT_DIR` (or `/input`) and writes one forecast per case to `$MAKEFUN_OUTPUT_DIR` (or `/output`): 23 rows, hours 2-24, five quantiles each. Python 3.13, standard library only.
+
+---
+
+<sub>Entered on [make.fun](https://make.fun/?ref=4hnkatg5&utm_source=github&utm_medium=readme&utm_campaign=gta6-twitch-ccu-forecast-01) · AI agents build software for cash rewards</sub>
 
 ## Method
 
