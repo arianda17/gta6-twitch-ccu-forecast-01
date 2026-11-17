@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
-"""GTA VI Twitch CCU forecast (v3 method, rebuilt by Muse).
+"""GTA VI Twitch CCU forecast -- v3 method, re-implemented by Muse.
 
-Forecasts hourly Twitch concurrent viewers for hours 2-24 of a launch day,
+Forecasts hourly Twitch concurrent viewers for hours 2-24 of a launch day
 as quantiles (5/25/50/75/95) of the viewer count.
 
-Method: empirical quantiles of the log viewer ratio, taken over past launch
-comparables. The anchor is the pre-midnight hour (hour 0, from history_hourly
-at day_start - 1h) when present: every comparable's curve is expressed as
-log(viewers_h / viewers_0), comparables are weighted by unlock-pattern
-similarity to a rolling-midnight launch and by Gaussian similarity of their
-pre-midnight-to-hour-1 spike to the case's own spike, then per-hour weighted
-quantiles are shrunk toward the median and spread-capped, and the whole curve
-is calibrated so the weighted-median hour-1 ratio matches the case's actual
-pre-midnight -> hour-1 transition. Without a pre-midnight point it falls back
-to the hour-1 print as anchor, with unlock-pattern weighting only.
+Method (v3, pinned constants from an honest grid search on the practice
+mean only): anchor on the pre-midnight hour (hour 0, from history_hourly at
+day_start - 1h). Each comparable's curve is expressed as log(viewers_h /
+viewers_0). Comparables are weighted by unlock-pattern similarity to a
+rolling-midnight launch and by Gaussian similarity (sigma 0.12) of their
+pre-midnight -> hour-1 spike to the case's own spike. Per-hour weighted
+quantiles of the log-ratios are shrunk toward the median (K 30) and
+spread-capped (cap factor 1.0, sigma_h = 0.15*sqrt(h-1)); the whole curve
+is then calibrated so the weighted-median hour-1 ratio matches the case's
+own pre-midnight -> hour-1 transition. Without a pre-midnight point it
+falls back to the hour-1 print as anchor, unlock-pattern weighting only.
+No smoothing (window 1).
 
-Constants (v3, from an honest grid search on the practice mean only):
-sigma 0.12 for the a_case similarity kernel, shrinkage K 30, spread cap 1.0,
-no smoothing. Practice mean (log pinball loss): 0.176642.
+Practice mean (log pinball loss): 0.176642
+  p00 0.259206, p01 0.135130, p02 0.129290, p03 0.182941.
 
 Stdlib only, deterministic, offline, no network, no model calls.
 Reads case files (*.in) from $MAKEFUN_INPUT_DIR (default /input), writes
@@ -35,11 +36,13 @@ INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
 TAUS = [0.05, 0.25, 0.5, 0.75, 0.95]
+# Standard-normal quantiles, rounded to 3 decimals (as tuned in v3).
 Z_SCORE = {0.05: -1.645, 0.25: -0.674, 0.5: 0.0, 0.75: 0.674, 0.95: 1.645}
 SHRINK_K = 30.0
 CAP_FACTOR = 1.0
-SMOOTH_WIN = 1
+SMOOTH_WINDOW = 1
 SIM_SIGMA = 0.12
+HOURS = list(range(2, 25))
 
 
 def parse_time(text):
@@ -67,7 +70,12 @@ def quantile_plain(values, q):
 
 
 def quantile_weighted(values, weights, q):
-    """Weighted quantile by cumulative-weight interpolation."""
+    """Weighted quantile by cumulative-weight interpolation.
+
+    Values are sorted ascending with their weights; the quantile is the
+    value where the cumulative weight first reaches q * total, linearly
+    interpolated across the weight interval of the bracketing value.
+    """
     if not values:
         return 0.0
     n = len(values)
@@ -126,7 +134,7 @@ def unlock_weight(text):
 
 
 def spike_similarity(a_comp, a_case, sigma):
-    """Gaussian similarity between a comparable's pre-midnight->hour-1
+    """Gaussian similarity between a comparable's pre-midnight -> hour-1
     log-ratio and the case's own."""
     if sigma <= 0:
         return 1.0
@@ -224,7 +232,7 @@ def smooth_medians(q_by_hour, hours):
     """Smooth the median curve across hours (window 1 = no-op) and shift
     every quantile of each hour by the median's movement."""
     meds = [q_by_hour[h][0.5] for h in hours]
-    smoothed = smooth(meds, SMOOTH_WIN)
+    smoothed = smooth(meds, SMOOTH_WINDOW)
     for h, m in zip(hours, smoothed):
         shift = m - q_by_hour[h][0.5]
         for tau in TAUS:
@@ -245,7 +253,7 @@ def forecast(case):
     if p1 < 1:
         p1 = 1.0
 
-    hours = list(range(2, 25))
+    hours = HOURS
     pre = case_pre_midnight(case)
 
     if pre is not None:
